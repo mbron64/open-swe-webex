@@ -12,6 +12,23 @@
   <h3>Open-source framework for building your org's internal coding agent.</h3>
 </div>
 
+> **Fork Notice** — This is a fork of [langchain-ai/open-swe](https://github.com/langchain-ai/open-swe) that adds **Cisco Webex** as a trigger surface. All changes are additive and backward-compatible with the upstream project. We'd love to contribute this back — PRs welcome.
+>
+> ### What was added
+>
+> | Area | Changes |
+> |---|---|
+> | **Webhook endpoint** | `POST /webhooks/webex` — receives Webex `messages:created` events with HMAC-SHA1 signature verification |
+> | **Agent tool** | `webex_reply` — posts threaded markdown messages back to the originating Webex space |
+> | **Utilities** | `agent/utils/webex.py` — message fetching, posting, thread context, bot-mention stripping, person lookup |
+> | **Prompt updates** | System prompt sections updated to include `webex_reply` in tool descriptions and task execution flow |
+> | **Documentation** | `.env.example` created, `INSTALLATION.md` updated with full Webex setup walkthrough, `README.md` updated |
+> | **Tests** | 23 unit tests covering signature verification, webhook handling, message formatting, and repo config parsing |
+>
+> **Files changed:** 10 &nbsp;|&nbsp; **Lines added:** 872
+
+---
+
 <div align="center">
   <a href="https://opensource.org/licenses/MIT" target="_blank"><img src="https://img.shields.io/github/license/langchain-ai/open-swe" alt="License"></a>
   <a href="https://github.com/langchain-ai/open-swe/stargazers" target="_blank"><img src="https://img.shields.io/github/stars/langchain-ai/open-swe" alt="GitHub Stars"></a>
