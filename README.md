@@ -12,15 +12,15 @@
   <h3>Open-source framework for building your org's internal coding agent.</h3>
 </div>
 
-> **This fork adds Webex support** to [langchain-ai/open-swe](https://github.com/langchain-ai/open-swe). Mention the bot in any Webex space and it picks up your task, works in a sandbox, and replies in-thread — same as the existing Slack and Linear integrations. All changes are additive and backward-compatible.
+> **This fork adds Webex support** to [langchain-ai/open-swe](https://github.com/langchain-ai/open-swe). Mention the bot in any Webex space and it picks up your task, works in a sandbox, and replies in-thread, same as the existing Slack and Linear integrations. All changes are additive and backward-compatible.
 >
 > ### What was added
 >
 > | Area | Changes |
 > |---|---|
-> | **Webhook endpoint** | `POST /webhooks/webex` — receives Webex `messages:created` events with HMAC-SHA1 signature verification |
-> | **Agent tool** | `webex_reply` — posts threaded markdown messages back to the originating Webex space |
-> | **Utilities** | `agent/utils/webex.py` — message fetching, posting, thread context, bot-mention stripping, person lookup |
+> | **Webhook endpoint** | `POST /webhooks/webex` receives Webex `messages:created` events with HMAC-SHA1 signature verification |
+> | **Agent tool** | `webex_reply` posts threaded markdown messages back to the originating Webex space |
+> | **Utilities** | `agent/utils/webex.py` for message fetching, posting, thread context, bot-mention stripping, and person lookup |
 > | **Prompt updates** | System prompt updated to include `webex_reply` in tool descriptions and task execution flow |
 > | **Documentation** | `.env.example` created, `INSTALLATION.md` updated with full Webex setup walkthrough, `README.md` updated |
 > | **Tests** | 23 unit tests covering signature verification, webhook handling, message formatting, and repo config parsing |
