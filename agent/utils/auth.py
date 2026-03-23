@@ -19,6 +19,7 @@ from .github_token import get_github_token_from_thread
 from .github_user_email_map import GITHUB_USER_EMAIL_MAP
 from .linear import comment_on_linear_issue
 from .slack import post_slack_ephemeral_message, post_slack_thread_reply
+from .webex import post_webex_message
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +263,18 @@ async def leave_failure_comment(
             "Auth failure for GitHub-triggered run (no token to post comment): %s", message
         )
         return
+    if source == "webex":
+        webex_thread = configurable.get("webex_thread", {})
+        room_id = webex_thread.get("room_id") if isinstance(webex_thread, dict) else None
+        parent_id = webex_thread.get("parent_id") if isinstance(webex_thread, dict) else None
+        if room_id:
+            logger.info(
+                "Posting auth failure reply to Webex room %s (source=%s)",
+                room_id,
+                source,
+            )
+            await post_webex_message(room_id, message, parent_id=parent_id)
+        return
     raise ValueError(f"Unknown source: {source}")
 
 
@@ -363,6 +376,9 @@ async def resolve_github_token(config: RunnableConfig, thread_id: str) -> tuple[
     Routes to the correct auth method depending on whether the run was
     triggered from GitHub (login-based) or Linear/Slack (email-based).
 
+    For Webex-triggered runs with a github_token_override, uses the user's
+    personal OAuth token directly, bypassing bot-token-only mode.
+
     In bot-token-only mode (LANGSMITH_API_KEY_PROD set without
     X_SERVICE_AUTH_JWT_SECRET), the GitHub App installation token is used
     for all operations instead of per-user OAuth tokens.
@@ -373,10 +389,15 @@ async def resolve_github_token(config: RunnableConfig, thread_id: str) -> tuple[
     Raises:
         RuntimeError: If source is missing or token resolution fails.
     """
+    configurable = config["configurable"]
+    override_token = configurable.get("github_token_override")
+    if override_token:
+        logger.info("Using per-user GitHub OAuth token for thread %s", thread_id)
+        encrypted = await persist_encrypted_github_token(thread_id, override_token)
+        return override_token, encrypted
+
     if is_bot_token_only_mode():
         return await _resolve_bot_installation_token(thread_id)
-
-    configurable = config["configurable"]
     source = configurable.get("source")
     if not source:
         logger.error("Missing source for thread %s; cannot route auth failure responses", thread_id)

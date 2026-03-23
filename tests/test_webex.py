@@ -3,17 +3,26 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent import webapp
+from agent.utils.audit import log_audit_event
+from agent.utils.github_oauth import (
+    _generate_pkce,
+    decrypt_oauth_state,
+    has_user_token,
+    store_user_tokens,
+)
 from agent.utils.webex import (
     format_webex_messages_for_prompt,
     strip_bot_mention,
     verify_webex_signature,
 )
-from agent.webapp import generate_thread_id_from_webex
+from agent.webapp import _is_webex_user_allowed, generate_thread_id_from_webex
 
 _TEST_WEBHOOK_SECRET = "test-webex-secret"
 
@@ -255,3 +264,177 @@ def test_webex_webhook_verify_endpoint() -> None:
     response = client.get("/webhooks/webex")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# User allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_is_webex_user_allowed_no_restrictions(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_DOMAINS", frozenset())
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_EMAILS", frozenset())
+    assert _is_webex_user_allowed("anyone@anywhere.com") is True
+
+
+def test_is_webex_user_allowed_by_email(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_DOMAINS", frozenset())
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_EMAILS", frozenset({"alice@acme.com"}))
+    assert _is_webex_user_allowed("alice@acme.com") is True
+    assert _is_webex_user_allowed("Alice@ACME.COM") is True
+    assert _is_webex_user_allowed("bob@acme.com") is False
+
+
+def test_is_webex_user_allowed_by_domain(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_DOMAINS", frozenset({"acme.com"}))
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_EMAILS", frozenset())
+    assert _is_webex_user_allowed("anyone@acme.com") is True
+    assert _is_webex_user_allowed("anyone@other.com") is False
+
+
+def test_is_webex_user_allowed_combined(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_DOMAINS", frozenset({"acme.com"}))
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_EMAILS", frozenset({"special@other.com"}))
+    assert _is_webex_user_allowed("anyone@acme.com") is True
+    assert _is_webex_user_allowed("special@other.com") is True
+    assert _is_webex_user_allowed("random@other.com") is False
+
+
+def test_webex_webhook_rejects_unauthorized_user(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(webapp, "WEBEX_WEBHOOK_SECRET", _TEST_WEBHOOK_SECRET)
+    monkeypatch.setattr(webapp, "WEBEX_BOT_EMAIL", "open-swe@webex.bot")
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_EMAILS", frozenset({"allowed@acme.com"}))
+    monkeypatch.setattr(webapp, "WEBEX_ALLOWED_DOMAINS", frozenset())
+
+    sent_messages: list[tuple] = []
+
+    async def fake_post(room_id, text, **kwargs):
+        sent_messages.append((room_id, text))
+
+    monkeypatch.setattr(webapp, "post_webex_message", fake_post)
+    client = TestClient(webapp.app)
+
+    response = _post_webex_webhook(
+        client,
+        {
+            "resource": "messages",
+            "event": "created",
+            "data": {
+                "id": "msg1",
+                "roomId": "room1",
+                "personEmail": "intruder@evil.com",
+                "text": "hack the repo",
+            },
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "ignored"
+    assert "allowlist" in response.json()["reason"].lower()
+
+
+# ---------------------------------------------------------------------------
+# PKCE generation
+# ---------------------------------------------------------------------------
+
+
+def test_pkce_generates_valid_pair() -> None:
+    verifier, challenge = _generate_pkce()
+    assert len(verifier) > 40
+    assert len(challenge) > 20
+    assert verifier != challenge
+
+
+def test_pkce_is_unique_each_call() -> None:
+    v1, _ = _generate_pkce()
+    v2, _ = _generate_pkce()
+    assert v1 != v2
+
+
+# ---------------------------------------------------------------------------
+# OAuth state encryption
+# ---------------------------------------------------------------------------
+
+
+def test_decrypt_oauth_state_returns_none_for_garbage() -> None:
+    assert decrypt_oauth_state("not-valid-encrypted-data") is None
+
+
+# ---------------------------------------------------------------------------
+# Token store
+# ---------------------------------------------------------------------------
+
+
+def test_store_and_check_user_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    import base64
+
+    fake_key = base64.urlsafe_b64encode(os.urandom(32)).decode()
+    monkeypatch.setenv("TOKEN_ENCRYPTION_KEY", fake_key)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        token_path = os.path.join(tmpdir, "tokens.json")
+        import agent.utils.github_oauth as oauth_mod
+
+        monkeypatch.setattr(oauth_mod, "_TOKEN_FILE", __import__("pathlib").Path(token_path))
+
+        assert has_user_token("test@example.com") is False
+        store_user_tokens("test@example.com", "ghp_abc123", "ghr_refresh123", 28800)
+        assert has_user_token("test@example.com") is True
+        assert has_user_token("TEST@EXAMPLE.COM") is True
+        assert has_user_token("other@example.com") is False
+
+
+# ---------------------------------------------------------------------------
+# Audit logging
+# ---------------------------------------------------------------------------
+
+
+def test_audit_log_emits_json() -> None:
+    import io
+    import logging
+
+    audit_logger = logging.getLogger("openswe.audit")
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    audit_logger.addHandler(handler)
+    try:
+        log_audit_event(
+            "test.event",
+            user_email="alice@acme.com",
+            room_id="room1",
+            outcome="success",
+        )
+        output = buf.getvalue()
+        assert output.strip()
+        parsed = json.loads(output.strip())
+        assert parsed["event"] == "test.event"
+        assert parsed["user_email"] == "alice@acme.com"
+        assert parsed["outcome"] == "success"
+        assert "ts" in parsed
+    finally:
+        audit_logger.removeHandler(handler)
+
+
+# ---------------------------------------------------------------------------
+# OAuth callback endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_github_oauth_callback_missing_params() -> None:
+    client = TestClient(webapp.app)
+    response = client.get("/auth/github/callback")
+    assert response.status_code == 400
+
+
+def test_github_oauth_callback_error_param() -> None:
+    client = TestClient(webapp.app)
+    response = client.get("/auth/github/callback?error=access_denied")
+    assert response.status_code == 200
+    assert "cancelled" in response.text.lower()
+
+
+def test_github_oauth_callback_invalid_state() -> None:
+    client = TestClient(webapp.app)
+    response = client.get("/auth/github/callback?code=abc&state=invalid")
+    assert response.status_code == 400
+    assert "expired" in response.text.lower() or "invalid" in response.text.lower()

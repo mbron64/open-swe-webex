@@ -11,10 +11,12 @@ from typing import Any
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from langchain_core.messages.content import create_text_block
 from langgraph_sdk import get_client
 from langgraph_sdk.client import LangGraphClient
 
+from .utils.audit import log_audit_event
 from .utils.auth import (
     is_bot_token_only_mode,
     persist_encrypted_github_token,
@@ -33,6 +35,13 @@ from .utils.github_comments import (
     react_to_github_comment,
     sanitize_github_comment_body,
     verify_github_signature,
+)
+from .utils.github_oauth import (
+    decrypt_oauth_state,
+    exchange_code_for_tokens,
+    get_github_oauth_url,
+    get_user_token,
+    store_user_tokens,
 )
 from .utils.github_token import get_github_token_from_thread
 from .utils.github_user_email_map import GITHUB_USER_EMAIL_MAP
@@ -56,6 +65,7 @@ from .utils.webex import (
     fetch_webex_thread_messages,
     format_webex_messages_for_prompt,
     get_webex_person,
+    post_webex_message,
     post_webex_trace_reply,
     verify_webex_signature,
 )
@@ -79,6 +89,14 @@ WEBEX_WEBHOOK_SECRET = os.environ.get("WEBEX_WEBHOOK_SECRET", "")
 WEBEX_BOT_EMAIL = os.environ.get("WEBEX_BOT_EMAIL", "")
 WEBEX_REPO_OWNER = os.environ.get("WEBEX_REPO_OWNER", "langchain-ai")
 WEBEX_REPO_NAME = os.environ.get("WEBEX_REPO_NAME", "open-swe")
+WEBEX_SHOW_TRACE_LINK = os.environ.get("WEBEX_SHOW_TRACE_LINK", "false").lower() == "true"
+
+WEBEX_ALLOWED_DOMAINS: frozenset[str] = frozenset(
+    d.strip().lower() for d in os.environ.get("WEBEX_ALLOWED_DOMAINS", "").split(",") if d.strip()
+)
+WEBEX_ALLOWED_EMAILS: frozenset[str] = frozenset(
+    e.strip().lower() for e in os.environ.get("WEBEX_ALLOWED_EMAILS", "").split(",") if e.strip()
+)
 
 LANGGRAPH_URL = os.environ.get("LANGGRAPH_URL") or os.environ.get(
     "LANGGRAPH_URL_PROD", "http://localhost:2024"
@@ -319,6 +337,21 @@ def _extract_repo_config_from_thread(thread: dict[str, Any]) -> dict[str, str] |
 def _is_not_found_error(exc: Exception) -> bool:
     """Best-effort check for LangGraph 404 errors."""
     return getattr(exc, "status_code", None) == 404
+
+
+def _is_webex_user_allowed(email: str) -> bool:
+    """Check if a Webex user is in the allowlist.
+
+    Returns True if no allowlist is configured (both WEBEX_ALLOWED_DOMAINS and
+    WEBEX_ALLOWED_EMAILS are empty), or if the user's email or domain matches.
+    """
+    if not WEBEX_ALLOWED_DOMAINS and not WEBEX_ALLOWED_EMAILS:
+        return True
+    email_lower = email.lower()
+    if email_lower in WEBEX_ALLOWED_EMAILS:
+        return True
+    domain = email_lower.split("@", 1)[-1] if "@" in email_lower else ""
+    return domain in WEBEX_ALLOWED_DOMAINS
 
 
 def _is_repo_org_allowed(repo_config: dict[str, str]) -> bool:
@@ -1577,6 +1610,30 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
     display_name = (person.get("displayName", "") if person else "") or person_email
     user_email = person_email
 
+    github_token = await get_user_token(user_email)
+    if not github_token:
+        oauth_url = get_github_oauth_url(user_email, room_id, parent_id)
+        if oauth_url:
+            log_audit_event(
+                "webex.oauth_link_sent",
+                user_email=user_email,
+                room_id=room_id,
+                outcome="pending_auth",
+            )
+            await post_webex_message(
+                room_id,
+                f"Before I can help, I need to verify your GitHub access.\n\n"
+                f"[Click here to connect GitHub]({oauth_url})",
+                parent_id=parent_id,
+            )
+        else:
+            await post_webex_message(
+                room_id,
+                "GitHub OAuth is not configured. Please contact your administrator.",
+                parent_id=parent_id,
+            )
+        return
+
     thread_context = ""
     if full_message.get("parentId"):
         thread_messages = await fetch_webex_thread_messages(room_id, parent_id)
@@ -1610,6 +1667,7 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
         },
         "user_email": user_email,
         "source": "webex",
+        "github_token_override": github_token,
     }
 
     thread_active = await is_thread_active(thread_id)
@@ -1625,6 +1683,7 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
             logger.error("Failed to queue Webex message for thread %s", thread_id)
         return
 
+    repo_label = f"{repo_config.get('owner')}/{repo_config.get('name')}"
     langgraph_client = get_client(url=LANGGRAPH_URL)
     run = await langgraph_client.runs.create(
         thread_id,
@@ -1634,7 +1693,19 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
         if_not_exists="create",
         multitask_strategy="interrupt",
     )
-    await post_webex_trace_reply(room_id, parent_id, run["run_id"])
+    log_audit_event(
+        "webex.run_started",
+        user_email=user_email,
+        room_id=room_id,
+        repo=repo_label,
+        thread_id=thread_id,
+        run_id=run.get("run_id", ""),
+        outcome="started",
+    )
+    if WEBEX_SHOW_TRACE_LINK:
+        await post_webex_trace_reply(room_id, parent_id, run["run_id"])
+    else:
+        await post_webex_message(room_id, "Got it, working on this now.", parent_id=parent_id)
 
 
 @app.post("/webhooks/webex")
@@ -1666,6 +1737,25 @@ async def webex_webhook(request: Request, background_tasks: BackgroundTasks) -> 
         logger.debug("Ignoring Webex webhook: message is from the bot itself")
         return {"status": "ignored", "reason": "Message is from the bot"}
 
+    if not _is_webex_user_allowed(person_email):
+        logger.warning("Rejecting Webex webhook: user '%s' not in allowlist", person_email)
+        log_audit_event(
+            "webex.user_rejected",
+            user_email=person_email,
+            room_id=data.get("roomId", ""),
+            outcome="denied",
+            detail="User not in allowlist",
+        )
+        room_id = data.get("roomId", "")
+        if room_id:
+            background_tasks.add_task(
+                post_webex_message,
+                room_id,
+                "Sorry, you're not authorized to use this bot. Please contact your administrator.",
+                parent_id=data.get("parentId"),
+            )
+        return {"status": "ignored", "reason": "User not in allowlist"}
+
     message_text = data.get("text", "")
     repo_config = _get_webex_repo_config(message_text)
 
@@ -1685,3 +1775,83 @@ async def webex_webhook(request: Request, background_tasks: BackgroundTasks) -> 
 async def webex_webhook_verify() -> dict[str, str]:
     """Verify endpoint for Webex webhook setup."""
     return {"status": "ok", "message": "Webex webhook endpoint is active"}
+
+
+@app.get("/auth/github/callback")
+async def github_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
+) -> HTMLResponse:
+    """Handle the GitHub OAuth callback after user authorization."""
+    if error:
+        logger.warning("GitHub OAuth denied by user: %s", error)
+        return HTMLResponse(
+            "<html><body><h2>Authorization cancelled</h2>"
+            "<p>You can close this tab and try again later.</p></body></html>",
+            status_code=200,
+        )
+
+    if not code or not state:
+        return HTMLResponse(
+            "<html><body><h2>Invalid request</h2>"
+            "<p>Missing authorization code or state.</p></body></html>",
+            status_code=400,
+        )
+
+    state_data = decrypt_oauth_state(state)
+    if not state_data:
+        return HTMLResponse(
+            "<html><body><h2>Invalid or expired link</h2>"
+            "<p>Please request a new authorization link from the bot.</p></body></html>",
+            status_code=400,
+        )
+
+    email = state_data.get("email", "")
+    room_id = state_data.get("room_id", "")
+    parent_id = state_data.get("parent_id") or None
+    code_verifier = state_data.get("code_verifier", "")
+
+    tokens = await exchange_code_for_tokens(code, code_verifier)
+    if not tokens or "access_token" not in tokens:
+        logger.error("GitHub OAuth token exchange failed for %s", email)
+        if room_id:
+            await post_webex_message(
+                room_id,
+                "GitHub authorization failed. Please try again.",
+                parent_id=parent_id,
+            )
+        return HTMLResponse(
+            "<html><body><h2>Authorization failed</h2>"
+            "<p>Could not complete GitHub authentication. Please try again.</p></body></html>",
+            status_code=500,
+        )
+
+    store_user_tokens(
+        email=email,
+        access_token=tokens["access_token"],
+        refresh_token=tokens.get("refresh_token", ""),
+        expires_in=tokens.get("expires_in"),
+    )
+
+    logger.info("GitHub OAuth completed for %s", email)
+    log_audit_event(
+        "webex.oauth_completed",
+        user_email=email,
+        room_id=room_id,
+        outcome="success",
+    )
+
+    if room_id:
+        await post_webex_message(
+            room_id,
+            "GitHub connected! You can now ask me to work on your repos.",
+            parent_id=parent_id,
+        )
+
+    return HTMLResponse(
+        "<html><body><h2>GitHub connected!</h2>"
+        "<p>You can close this tab and return to Webex.</p></body></html>",
+        status_code=200,
+    )
