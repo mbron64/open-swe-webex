@@ -34,6 +34,9 @@ yarn-error.log*
 .env*.local
 .env
 
+# OAuth token store
+.data/
+
 # vercel
 .vercel
 

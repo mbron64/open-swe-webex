@@ -63,6 +63,43 @@ from .utils.github import (
 )
 from .utils.sandbox_paths import aresolve_repo_dir, aresolve_sandbox_work_dir
 from .utils.sandbox_state import SANDBOX_BACKENDS, get_sandbox_id_from_metadata
+from .utils.webex import post_webex_message
+
+
+async def _notify_webex_on_repo_error(
+    exc: Exception, repo_owner: str | None, repo_name: str | None
+) -> None:
+    """If the current run was triggered from Webex, post a user-friendly error."""
+    try:
+        config = get_config()
+        configurable = config.get("configurable", {})
+        if configurable.get("source") != "webex":
+            return
+        webex_thread = configurable.get("webex_thread", {})
+        room_id = webex_thread.get("room_id")
+        parent_id = webex_thread.get("parent_id")
+        if not room_id:
+            return
+
+        repo_label = f"{repo_owner}/{repo_name}" if repo_owner and repo_name else "the repository"
+        error_hint = str(exc)[:200]
+        access_denied = any(
+            keyword in error_hint.lower()
+            for keyword in ("403", "404", "permission", "denied", "not found", "authentication")
+        )
+        if access_denied:
+            msg = (
+                f"I don't have access to **{repo_label}**. "
+                "Please check that your GitHub account has permission to this repo."
+            )
+        else:
+            msg = (
+                f"Something went wrong while accessing **{repo_label}**. "
+                "Please try again or contact your administrator."
+            )
+        await post_webex_message(room_id, msg, parent_id=parent_id)
+    except Exception:
+        logger.warning("Failed to send Webex error notification", exc_info=True)
 
 
 async def _clone_or_pull_repo_in_sandbox(  # noqa: PLR0915
@@ -281,8 +318,9 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
                 sandbox_backend, repo_dir = await _recreate_sandbox(
                     thread_id, repo_owner, repo_name, github_token=github_token
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to pull repo in cached sandbox")
+                await _notify_webex_on_repo_error(exc, repo_owner, repo_name)
                 raise
 
     elif sandbox_id is None:
@@ -306,8 +344,9 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
                     thread_id=thread_id,
                     metadata={"repo_dir": repo_dir},
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to create sandbox or clone repo")
+            await _notify_webex_on_repo_error(exc, repo_owner, repo_name)
             try:
                 await client.threads.update(thread_id=thread_id, metadata={"sandbox_id": None})
                 logger.info("Reset sandbox_id to None for thread %s", thread_id)
@@ -353,8 +392,9 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
                 sandbox_backend, repo_dir = await _recreate_sandbox(
                     thread_id, repo_owner, repo_name, github_token=github_token
                 )
-            except Exception:
+            except Exception as exc:
                 logger.exception("Failed to pull repo in existing sandbox")
+                await _notify_webex_on_repo_error(exc, repo_owner, repo_name)
                 raise
 
     SANDBOX_BACKENDS[thread_id] = sandbox_backend

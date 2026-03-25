@@ -12,7 +12,7 @@
   <h3>Open-source framework for building your org's internal coding agent.</h3>
 </div>
 
-> **This fork adds Webex support** to [langchain-ai/open-swe](https://github.com/langchain-ai/open-swe). Mention the bot in any Webex space and it picks up your task, works in a sandbox, and replies in-thread, same as the existing Slack and Linear integrations. All changes are additive and backward-compatible.
+> **This fork adds Webex support and enterprise access control** to [langchain-ai/open-swe](https://github.com/langchain-ai/open-swe). Mention the bot in any Webex space and it picks up your task, works in a sandbox, and replies in-thread, same as the existing Slack and Linear integrations. All changes are additive and backward-compatible.
 >
 > ### What was added
 >
@@ -21,11 +21,13 @@
 > | **Webhook endpoint** | `POST /webhooks/webex` receives Webex `messages:created` events with HMAC-SHA1 signature verification |
 > | **Agent tool** | `webex_reply` posts threaded markdown messages back to the originating Webex space |
 > | **Utilities** | `agent/utils/webex.py` for message fetching, posting, thread context, bot-mention stripping, and person lookup |
-> | **Prompt updates** | System prompt updated to include `webex_reply` in tool descriptions and task execution flow |
-> | **Documentation** | `.env.example` created, `INSTALLATION.md` updated with full Webex setup walkthrough, `README.md` updated |
-> | **Tests** | 23 unit tests covering signature verification, webhook handling, message formatting, and repo config parsing |
->
-> **10 files changed, 872 lines added**
+> | **Per-user GitHub OAuth** | Each Webex user authenticates with their own GitHub account via the GitHub App OAuth flow (PKCE, token refresh) |
+> | **User allowlist** | `WEBEX_ALLOWED_DOMAINS` / `WEBEX_ALLOWED_EMAILS` restricts who can use the bot |
+> | **Audit logging** | Structured JSON audit trail for all Webex interactions (user rejections, OAuth events, run starts) |
+> | **Repo access errors** | Catches clone/pull failures and sends user-friendly error messages in Webex |
+> | **Trace link toggle** | `WEBEX_SHOW_TRACE_LINK` controls whether end users see LangSmith trace links or a simple status message |
+> | **Documentation** | `.env.example`, `INSTALLATION.md` (enterprise setup section), `README.md` updated |
+> | **Tests** | Unit tests covering signature verification, webhook handling, message formatting, allowlist, and OAuth flow |
 
 ---
 

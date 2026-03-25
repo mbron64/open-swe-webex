@@ -418,9 +418,78 @@ The server runs on `http://localhost:2024` with these endpoints:
    - A new run in your LangSmith project
    - The agent replies in the same Webex thread with its response
 
-## 9. Production deployment
+## 9. Enterprise Access Control (Webex)
 
-For production, deploy the agent on [LangGraph Cloud](https://langchain-ai.github.io/langgraph/cloud/) instead of running locally:
+If you're running the Webex integration for a team or pilot, these controls ensure only authorized users can interact with the bot and that each user operates with their own GitHub permissions.
+
+### 9a. User allowlist
+
+Restrict who can use the bot by setting one or both of these in your `.env`:
+
+```
+WEBEX_ALLOWED_DOMAINS="acme.com,partner.co"
+WEBEX_ALLOWED_EMAILS="natalie@acme.com,bryce@acme.com"
+```
+
+If both are empty, all Webex users can interact with the bot. When set, unauthorized users receive a rejection message.
+
+### 9b. Per-user GitHub authentication
+
+By default, all operations use the shared GitHub App bot token. For enterprise use, you can require each user to authenticate with their own GitHub account so the agent only accesses repos that user has permission for.
+
+**Prerequisites (one-time setup):**
+
+1. In your GitHub App settings, note the **Client ID** (different from App ID).
+2. Generate a **Client secret** in your GitHub App settings.
+3. Under "Callback URL", add your callback URL (e.g. `https://your-domain/auth/github/callback`).
+4. Ensure the app has the `Repository contents: Read` permission enabled.
+
+**Environment variables:**
+
+```
+GITHUB_CLIENT_ID="Iv1.abc123..."
+GITHUB_CLIENT_SECRET="your-client-secret"
+GITHUB_OAUTH_CALLBACK_URL="https://your-domain/auth/github/callback"
+TOKEN_ENCRYPTION_KEY="..."    # Already required, used to encrypt stored tokens
+```
+
+**How it works:**
+
+1. When a user first messages the bot, they receive a "Connect GitHub" link.
+2. They click the link, authorize the GitHub App, and are redirected back.
+3. Their token is encrypted and stored locally (`.data/github_user_tokens.json`, git-ignored).
+4. All subsequent runs use that user's token, scoping access to their repos.
+5. Tokens auto-refresh (access tokens expire in 8 hours; refresh tokens last 6 months).
+
+### 9c. Trace link visibility
+
+By default, end users see a simple "Got it, working on this now." message. If you want to show LangSmith trace links (useful for operator debugging), set:
+
+```
+WEBEX_SHOW_TRACE_LINK="true"
+```
+
+### 9d. Audit logging
+
+All Webex interactions are logged as structured JSON to the `openswe.audit` logger. Events include:
+
+- `webex.user_rejected` -- unauthorized user attempt
+- `webex.oauth_link_sent` -- OAuth link sent to user
+- `webex.oauth_completed` -- user completed GitHub auth
+- `webex.run_started` -- agent run kicked off
+
+To route audit logs to a file, configure the `openswe.audit` logger in your Python logging config.
+
+### 9e. Recommended: 1:1 spaces
+
+For the best security posture during a pilot, have each user create a **1:1 space** with the bot rather than adding the bot to a group space. This prevents users from seeing each other's requests and responses.
+
+## 10. Production deployment
+
+For production, deploy the agent on [LangGraph Cloud](https://langchain-ai.github.io/langgraph/cloud/) instead of running locally.
+
+> **Note:** If you're using per-user GitHub OAuth (step 9b), make sure your production
+> `GITHUB_OAUTH_CALLBACK_URL` points to the production domain, not ngrok.
 
 1. Push your code to a GitHub repository
 2. Connect the repo to LangGraph Cloud
