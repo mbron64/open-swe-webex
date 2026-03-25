@@ -33,6 +33,7 @@ _TOKEN_FILE = Path(
         str(Path(__file__).resolve().parent.parent.parent / ".data" / "github_user_tokens.json"),
     )
 )
+_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 _file_lock = Lock()
 
@@ -189,19 +190,18 @@ def _read_token_store() -> dict[str, Any]:
 
 def _write_token_store(store: dict[str, Any]) -> None:
     """Atomically write the token store to disk."""
-    _TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = _TOKEN_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(store, indent=2))
     tmp.rename(_TOKEN_FILE)
 
 
-def store_user_tokens(
+def _store_user_tokens_sync(
     email: str,
     access_token: str,
     refresh_token: str,
     expires_in: int | None,
 ) -> None:
-    """Encrypt and persist a user's GitHub tokens."""
+    """Encrypt and persist a user's GitHub tokens (sync, runs in thread)."""
     expires_at = time.time() + expires_in if expires_in else 0.0
 
     entry = {
@@ -218,15 +218,34 @@ def store_user_tokens(
     logger.info("Stored GitHub OAuth tokens for %s (expires_at=%.0f)", email, expires_at)
 
 
+async def store_user_tokens(
+    email: str,
+    access_token: str,
+    refresh_token: str,
+    expires_in: int | None,
+) -> None:
+    """Encrypt and persist a user's GitHub tokens."""
+    import asyncio
+
+    await asyncio.to_thread(_store_user_tokens_sync, email, access_token, refresh_token, expires_in)
+
+
+def _get_user_token_sync(email: str) -> dict[str, Any] | None:
+    """Read a user's token entry from the store (sync, runs in thread)."""
+    with _file_lock:
+        store = _read_token_store()
+    return store.get(email.lower())
+
+
 async def get_user_token(email: str) -> str | None:
     """Retrieve a valid GitHub access token for a user.
 
     Automatically refreshes expired tokens. Returns None if no token is
     stored or if the refresh token has also expired.
     """
-    with _file_lock:
-        store = _read_token_store()
-    entry = store.get(email.lower())
+    import asyncio
+
+    entry = await asyncio.to_thread(_get_user_token_sync, email)
     if not entry:
         return None
 
@@ -241,17 +260,17 @@ async def get_user_token(email: str) -> str | None:
     stored_refresh = decrypt_token(entry.get("refresh_token", ""))
     if not stored_refresh:
         logger.info("Access token expired and no refresh token for %s", email)
-        _remove_user_tokens(email)
+        await asyncio.to_thread(_remove_user_tokens, email)
         return None
 
     logger.info("Access token expired for %s, refreshing", email)
     refreshed = await refresh_access_token(stored_refresh)
     if not refreshed or "access_token" not in refreshed:
         logger.warning("Token refresh failed for %s, clearing stored tokens", email)
-        _remove_user_tokens(email)
+        await asyncio.to_thread(_remove_user_tokens, email)
         return None
 
-    store_user_tokens(
+    await store_user_tokens(
         email,
         refreshed["access_token"],
         refreshed.get("refresh_token", stored_refresh),

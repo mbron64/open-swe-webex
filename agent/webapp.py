@@ -62,6 +62,7 @@ from .utils.slack import (
 )
 from .utils.webex import (
     fetch_webex_message,
+    fetch_webex_room_messages,
     fetch_webex_thread_messages,
     format_webex_messages_for_prompt,
     get_webex_person,
@@ -304,9 +305,15 @@ def generate_thread_id_from_slack_thread(channel_id: str, thread_id: str) -> str
     return str(uuid.UUID(hex=md5_hex))
 
 
-def generate_thread_id_from_webex(room_id: str, parent_id: str) -> str:
-    """Generate a deterministic thread ID from a Webex room and parent message."""
-    hash_bytes = hashlib.sha256(f"webex:{room_id}:{parent_id}".encode()).hexdigest()
+def generate_thread_id_from_webex(room_id: str, parent_id: str | None = None) -> str:
+    """Generate a deterministic thread ID from a Webex room.
+
+    For 1:1 (direct) spaces, only room_id is used so all messages share one
+    LangGraph thread.  For group spaces, parent_id scopes the thread to a
+    specific reply chain.
+    """
+    key = f"webex:{room_id}:{parent_id}" if parent_id else f"webex-direct:{room_id}"
+    hash_bytes = hashlib.sha256(key.encode()).hexdigest()
     return (
         f"{hash_bytes[:8]}-{hash_bytes[8:12]}-{hash_bytes[12:16]}-"
         f"{hash_bytes[16:20]}-{hash_bytes[20:32]}"
@@ -1604,7 +1611,10 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
     raw_text = full_message.get("text", "")
     clean_text = strip_webex_bot_mention(raw_text) or "(no text in mention)"
 
-    parent_id = full_message.get("parentId") or message_id
+    webex_parent_id = full_message.get("parentId")
+    is_threaded = webex_parent_id is not None
+
+    reply_parent_id = webex_parent_id or message_id
 
     person = await get_webex_person(person_id) if person_id else None
     display_name = (person.get("displayName", "") if person else "") or person_email
@@ -1612,7 +1622,7 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
 
     github_token = await get_user_token(user_email)
     if not github_token:
-        oauth_url = get_github_oauth_url(user_email, room_id, parent_id)
+        oauth_url = get_github_oauth_url(user_email, room_id, reply_parent_id)
         if oauth_url:
             log_audit_event(
                 "webex.oauth_link_sent",
@@ -1624,43 +1634,56 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
                 room_id,
                 f"Before I can help, I need to verify your GitHub access.\n\n"
                 f"[Click here to connect GitHub]({oauth_url})",
-                parent_id=parent_id,
+                parent_id=webex_parent_id,
             )
         else:
             await post_webex_message(
                 room_id,
                 "GitHub OAuth is not configured. Please contact your administrator.",
-                parent_id=parent_id,
+                parent_id=webex_parent_id,
             )
         return
 
     thread_context = ""
-    if full_message.get("parentId"):
-        thread_messages = await fetch_webex_thread_messages(room_id, parent_id)
+    if is_threaded:
+        thread_messages = await fetch_webex_thread_messages(room_id, webex_parent_id)
         if thread_messages:
             thread_context = format_webex_messages_for_prompt(thread_messages)
+    else:
+        room_messages = await fetch_webex_room_messages(room_id, max_messages=20)
+        if room_messages:
+            thread_context = format_webex_messages_for_prompt(room_messages)
 
     context_section = f"## Conversation Context\n{thread_context}\n\n" if thread_context else ""
+
+    if is_threaded:
+        thread_id = generate_thread_id_from_webex(room_id, webex_parent_id)
+    else:
+        thread_id = generate_thread_id_from_webex(room_id)
+
+    logger.info(
+        "Webex thread_id=%s is_threaded=%s context_len=%d",
+        thread_id,
+        is_threaded,
+        len(thread_context),
+    )
 
     prompt = (
         "You were mentioned in Webex.\n\n"
         f"## Repository\n{repo_config.get('owner')}/{repo_config.get('name')}\n\n"
         f"## Triggered by\n{display_name}\n\n"
-        f"## Webex Room\n- Room ID: {room_id}\n"
-        f"- Parent ID: {parent_id}\n\n"
+        f"## Webex Room\n- Room ID: {room_id}\n\n"
         f"{context_section}"
         f"## Latest Mention Request\n{clean_text}\n\n"
         "Use `webex_reply` to communicate in this Webex thread for clarifications, "
         "status updates, and final summaries."
     )
 
-    thread_id = generate_thread_id_from_webex(room_id, parent_id)
-
     configurable: dict[str, Any] = {
         "repo": repo_config,
         "webex_thread": {
             "room_id": room_id,
-            "parent_id": parent_id,
+            "parent_id": webex_parent_id,
             "triggering_person_id": person_id,
             "triggering_person_email": person_email,
             "triggering_display_name": display_name,
@@ -1703,9 +1726,9 @@ async def process_webex_mention(  # noqa: PLR0912, PLR0915
         outcome="started",
     )
     if WEBEX_SHOW_TRACE_LINK:
-        await post_webex_trace_reply(room_id, parent_id, run["run_id"])
+        await post_webex_trace_reply(room_id, webex_parent_id, run["run_id"])
     else:
-        await post_webex_message(room_id, "Got it, working on this now.", parent_id=parent_id)
+        await post_webex_message(room_id, "Got it, working on this now.", parent_id=webex_parent_id)
 
 
 @app.post("/webhooks/webex")
@@ -1828,7 +1851,7 @@ async def github_oauth_callback(
             status_code=500,
         )
 
-    store_user_tokens(
+    await store_user_tokens(
         email=email,
         access_token=tokens["access_token"],
         refresh_token=tokens.get("refresh_token", ""),

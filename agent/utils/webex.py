@@ -109,6 +109,55 @@ async def get_webex_person(person_id: str) -> dict[str, Any] | None:
             return None
 
 
+async def get_webex_room_type(room_id: str) -> str:
+    """Return the room type: 'direct' for 1:1 spaces, 'group' for group spaces."""
+    if not WEBEX_BOT_TOKEN:
+        return "group"
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{WEBEX_API_BASE_URL}/rooms/{room_id}",
+                headers=_webex_headers(),
+            )
+            response.raise_for_status()
+            return response.json().get("type", "group")
+        except httpx.HTTPError:
+            logger.exception("Failed to fetch Webex room %s type", room_id)
+            return "group"
+
+
+async def fetch_webex_room_messages(
+    room_id: str,
+    max_messages: int = 20,
+) -> list[dict[str, Any]]:
+    """Fetch recent messages from a room (for 1:1 conversation context)."""
+    if not WEBEX_BOT_TOKEN:
+        return []
+
+    params: dict[str, str | int] = {
+        "roomId": room_id,
+        "max": max_messages,
+    }
+
+    async with httpx.AsyncClient() as client:
+        try:
+            response = await client.get(
+                f"{WEBEX_API_BASE_URL}/messages",
+                headers=_webex_headers(),
+                params=params,
+            )
+            response.raise_for_status()
+            data = response.json()
+            items = data.get("items", [])
+            if isinstance(items, list):
+                items.reverse()
+                return items
+        except httpx.HTTPError:
+            logger.exception("Failed to fetch Webex room messages for room %s", room_id)
+    return []
+
+
 async def fetch_webex_thread_messages(
     room_id: str,
     parent_id: str,
